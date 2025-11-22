@@ -34,3 +34,6 @@ Outputs are written to `results/` (CSV, LaTeX, markdown) and `plots/` (PNG figur
 If you use this code or the associated predictions in your research, please cite:
 
 Özkaya, M. Y. (2025). Functional Consciousness Collapse Theory: A Computational Framework. arXiv preprint.
+
+## License
+This project is released under the MIT License (see `LICENSE`).
