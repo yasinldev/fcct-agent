@@ -1,0 +1,4 @@
+.venv/
+plots/
+results/
+__pycache__/
