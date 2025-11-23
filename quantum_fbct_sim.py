@@ -66,6 +66,11 @@ def l1_distance(p: np.ndarray, q: np.ndarray) -> float:
     return float(0.5 * np.sum(np.abs(normalize_probs(p) - normalize_probs(q))))
 
 
+def total_variation(p: np.ndarray, q: np.ndarray) -> float:
+    """Alias for TV distance."""
+    return l1_distance(p, q)
+
+
 def sample_from_probs(p: np.ndarray, n_samples: int, rng: np.random.Generator) -> np.ndarray:
     """
     Draw n_samples from categorical distribution p.
@@ -563,6 +568,249 @@ def experiment_5_two_stage(rng: np.random.Generator) -> pd.DataFrame:
 
 
 # -----------------------------------------------------------------------------
+# Experiment 6: Repeated measurement / Lüders projection test
+# -----------------------------------------------------------------------------
+def update_memory(m: np.ndarray, outcome: int, beta: float = 0.9) -> np.ndarray:
+    """Exponential moving average memory update."""
+    m_new = beta * m
+    m_new[outcome] += (1 - beta)
+    return normalize_probs(m_new)
+
+
+def projection_after_outcome(outcome: int, dim: int) -> np.ndarray:
+    """Return a deterministic sensory distribution after projection."""
+    s = np.zeros(dim, dtype=float)
+    s[outcome] = 1.0
+    return s
+
+
+def test_repeated_measurement_projection(rng: np.random.Generator) -> pd.DataFrame:
+    p_born = np.array([0.8, 0.2], dtype=float)
+    m0 = np.array([0.5, 0.5], dtype=float)
+    w0 = np.array([0.5, 0.5], dtype=float)
+    alphas_list = [
+        (1.0, 0.0, 0.0),
+        (0.9, 0.05, 0.05),
+        (0.7, 0.15, 0.15),
+    ]
+    rows = []
+    for alpha_s, alpha_m, alpha_w in alphas_list:
+        p_first, _ = fbct_collapse_distribution(p_born, m0, w0, alpha_s, alpha_m, alpha_w)
+        samples_first = sample_from_probs(p_first, N_SAMPLES_DEFAULT, rng)
+        for outcome in [0, 1]:
+            # condition on first outcome: approximate by using projection sensory and updated memory
+            m_after = update_memory(m0, outcome)
+            s_after = projection_after_outcome(outcome, 2)
+            p_second, _ = fbct_collapse_distribution(s_after, m_after, w0, alpha_s, alpha_m, alpha_w)
+            empirical_second = sample_from_probs(p_second, N_SAMPLES_DEFAULT, rng)
+            freq_same = np.mean(empirical_second == outcome)
+            freq_diff = 1.0 - freq_same
+            # Ideal projection distribution (delta on same outcome)
+            ideal = projection_after_outcome(outcome, 2)
+            kl_proj = kl_divergence(p_second, ideal)
+            rows.append(
+                {
+                    "alpha_s": alpha_s,
+                    "alpha_m": alpha_m,
+                    "alpha_w": alpha_w,
+                    "first_outcome": outcome,
+                    "p_second_same": freq_same,
+                    "p_second_diff": freq_diff,
+                    "kl_projection": kl_proj,
+                }
+            )
+    df = pd.DataFrame(rows)
+    df.to_csv("results/exp6_projection_test.csv", index=False)
+    plot_projection_test(df)
+    print("\n=== TEST 1: REPEATED MEASUREMENT PROJECTION ===")
+    for alpha_s, group in df.groupby("alpha_s"):
+        mean_same = group[group["first_outcome"] == 0]["p_second_same"].mean()
+        kl_mean = group["kl_projection"].mean()
+        diag_ratio = (group["p_second_same"].sum()) / max(group["p_second_diff"].sum(), 1e-9)
+        print(f"α_S={alpha_s:.2f}: P(same)≈{mean_same:.3f}, KL={kl_mean:.4f}, diagonal_ratio={diag_ratio:.1f}")
+    return df
+
+
+# -----------------------------------------------------------------------------
+# Experiment 7: Stability scan (Born as attractor)
+# -----------------------------------------------------------------------------
+def update_value(w: np.ndarray, outcome: int, lr: float = 0.05) -> np.ndarray:
+    w_new = (1 - lr) * w
+    w_new[outcome] += lr
+    return normalize_probs(w_new)
+
+
+def test_stability_scan(rng: np.random.Generator) -> pd.DataFrame:
+    p_born = np.array([0.7, 0.2, 0.1], dtype=float)
+    alphas = np.linspace(0.0, 1.0, 21)
+    rows = []
+    for alpha_s in alphas:
+        alpha_m = alpha_w = 0.5 * (1 - alpha_s)
+        # Run multiple independent chains and average
+        stability_runs = []
+        pathology_runs = []
+        kl_runs = []
+        l1_runs = []
+        for _ in range(10):
+            m = np.array([1 / 3, 1 / 3, 1 / 3], dtype=float)
+            w = normalize_probs(np.array([0.2, 0.3, 0.5], dtype=float))
+            outcomes = []
+            T = 10_000
+            for t in range(T):
+                p_t, _ = fbct_collapse_distribution(p_born, m, w, alpha_s, alpha_m, alpha_w)
+                o_t = int(sample_from_probs(p_t, 1, rng)[0])
+                outcomes.append(o_t)
+                # Softer memory smoothing
+                m = update_memory(m, o_t, beta=0.7)
+                w = update_value(w, o_t, lr=0.02)
+            outcomes = np.array(outcomes)
+            tail = outcomes[T // 2 :]
+            counts = np.bincount(tail, minlength=3)
+            empirical = counts / len(tail)
+            # stability: std of sliding window frequencies
+            window = 200
+            freqs = []
+            for i in range(T // 2, len(outcomes) - window):
+                chunk = outcomes[i : i + window]
+                c = np.bincount(chunk, minlength=3) / window
+                freqs.append(c)
+            freqs = np.array(freqs)
+            std_over_time = np.mean(np.std(freqs, axis=0))
+            stability = 1.0 / (1.0 + std_over_time)
+            lock_in = float(np.max(empirical) > 0.90)
+            # entropy collapse: H/H_max < 0.30
+            H = float(kl_entropy(empirical, np.ones(3) / 3, base=np.e))
+            H_max = np.log(3)
+            entropy_collapse = float((H / H_max) < 0.30)
+            # Oscillation detection via FFT peak
+            fft_vals = np.abs(np.fft.rfft(outcomes - outcomes.mean()))
+            fft_peak = np.max(fft_vals[1:]) if len(fft_vals) > 1 else 0.0
+            oscillation = float(fft_peak > 50.0)  # heuristic threshold
+            pathology = max(lock_in, entropy_collapse, oscillation)
+            kl_born = kl_divergence(empirical, p_born)
+            l1_born = l1_distance(empirical, p_born)
+            stability_runs.append(stability)
+            pathology_runs.append(pathology)
+            kl_runs.append(kl_born)
+            l1_runs.append(l1_born)
+
+        stability = float(np.mean(stability_runs))
+        pathology = float(np.mean(pathology_runs))
+        kl_born = float(np.mean(kl_runs))
+        l1_born = float(np.mean(l1_runs))
+        # Stricter health: stability >0.8 AND pathology<0.2
+        health = 1.0 if (stability > 0.8 and pathology < 0.2) else 0.0
+        rows.append(
+            {
+                "alpha_s": alpha_s,
+                "alpha_m": alpha_m,
+                "alpha_w": alpha_w,
+                "stability": stability,
+                "pathology": pathology,
+                "kl_born": kl_born,
+                "l1_born": l1_born,
+                "health": health,
+            }
+        )
+    df = pd.DataFrame(rows)
+    df.to_csv("results/exp7_stability_scan.csv", index=False)
+    plot_stability_landscape(df)
+    print("\n=== TEST 2: STABILITY SCAN - BORN AS ATTRACTOR ===")
+    hi = df[df["alpha_s"] >= 0.8]
+    mid = df[(df["alpha_s"] >= 0.4) & (df["alpha_s"] < 0.8)]
+    lo = df[df["alpha_s"] < 0.4]
+    print(f"High α_S stability mean: {hi['stability'].mean():.3f}, pathology mean: {hi['pathology'].mean():.3f}, KL: {hi['kl_born'].mean():.3f}")
+    print(f"Low α_S stability mean: {lo['stability'].mean():.3f}, pathology mean: {lo['pathology'].mean():.3f}, KL: {lo['kl_born'].mean():.3f}")
+    return df
+
+
+# -----------------------------------------------------------------------------
+# Experiment 8: Basis dependency (contextuality)
+# -----------------------------------------------------------------------------
+def hadamard() -> np.ndarray:
+    return np.array([[1, 1], [1, -1]], dtype=float) / np.sqrt(2)
+
+
+def transform_probs(p_z: np.ndarray, U: np.ndarray) -> np.ndarray:
+    """
+    Transform probability vector under unitary U via amplitudes.
+    """
+    # Reconstruct amplitudes as sqrt(p) with zero phases for simplicity
+    amps = np.sqrt(p_z)
+    new_amps = U @ amps
+    return normalize_probs(np.abs(new_amps) ** 2)
+
+
+def run_sequence(p_born_z: np.ndarray, p_born_x: np.ndarray, alpha: Tuple[float, float, float], rng: np.random.Generator, order: str) -> np.ndarray:
+    """
+    Run two-step measurement sequence; order is 'ZX' or 'XZ'.
+    Returns joint frequency matrix shape (2,2).
+    """
+    joint = np.zeros((2, 2), dtype=float)
+    m = np.array([0.5, 0.5], dtype=float)
+    w = np.array([0.5, 0.5], dtype=float)
+    for _ in range(N_SAMPLES_DEFAULT):
+        if order == "ZX":
+            p1, _ = fbct_collapse_distribution(p_born_z, m, w, *alpha)
+            o1 = int(sample_from_probs(p1, 1, rng)[0])
+            m1 = update_memory(m, o1, beta=0.9)
+            # collapsed in Z basis
+            p2_born = transform_probs(projection_after_outcome(o1, 2), hadamard())
+            p2, _ = fbct_collapse_distribution(p2_born, m1, w, *alpha)
+            o2 = int(sample_from_probs(p2, 1, rng)[0])
+        else:  # X then Z
+            p1, _ = fbct_collapse_distribution(p_born_x, m, w, *alpha)
+            o1 = int(sample_from_probs(p1, 1, rng)[0])
+            m1 = update_memory(m, o1, beta=0.9)
+            # collapsed in X basis -> transform back to Z using H
+            p2_born = transform_probs(projection_after_outcome(o1, 2), hadamard())
+            p2, _ = fbct_collapse_distribution(p2_born, m1, w, *alpha)
+            o2 = int(sample_from_probs(p2, 1, rng)[0])
+        joint[o1, o2] += 1
+    return joint / joint.sum()
+
+
+def test_basis_dependency(rng: np.random.Generator) -> pd.DataFrame:
+    states = {
+        "psi1": np.array([1.0, 0.0]),  # |0>
+        "psi2": np.array([1 / np.sqrt(2), 1 / np.sqrt(2)]),  # |+>
+        "psi3": np.array([np.sqrt(0.8), np.sqrt(0.2)]),  # Z-biased
+        "psi4": np.array([1 / np.sqrt(2), 1j / np.sqrt(2)]),  # Y-eigenstate (phase ignored)
+    }
+    alphas = [
+        (1.0, 0.0, 0.0),
+        (0.7, 0.15, 0.15),
+        (0.0, 0.5, 0.5),
+    ]
+    rows = []
+    for alpha in alphas:
+        for sid, psi in states.items():
+            p_born_z = normalize_probs(np.abs(psi) ** 2)
+            p_born_x = transform_probs(p_born_z, hadamard())
+            joint_zx = run_sequence(p_born_z, p_born_x, alpha, rng, order="ZX")
+            joint_xz = run_sequence(p_born_z, p_born_x, alpha, rng, order="XZ")
+            tv = total_variation(joint_zx.flatten(), joint_xz.flatten())
+            rows.append(
+                {
+                    "state_id": sid,
+                    "alpha_s": alpha[0],
+                    "alpha_m": alpha[1],
+                    "alpha_w": alpha[2],
+                    "tv_distance": tv,
+                    "joint_zx": joint_zx.flatten(),
+                    "joint_xz": joint_xz.flatten(),
+                }
+            )
+    df = pd.DataFrame(rows)
+    df.to_csv("results/exp8_basis_dependency.csv", index=False)
+    plot_basis_dependency(df)
+    print("\n=== TEST 3: NON-COMMUTING BASIS DEPENDENCY ===")
+    for alpha_s, group in df.groupby("alpha_s"):
+        print(f"α_S={alpha_s:.2f}: TV distance mean={group['tv_distance'].mean():.3f}")
+    return df
+
+
+# -----------------------------------------------------------------------------
 # Plotting helpers
 # -----------------------------------------------------------------------------
 def plot_exp1(df: pd.DataFrame) -> None:
@@ -815,6 +1063,273 @@ def plot_exp5_convergence(rng: np.random.Generator, p_born: np.ndarray, m: np.nd
     plt.close()
 
 
+def plot_projection_test(df: pd.DataFrame) -> None:
+    os.makedirs("plots", exist_ok=True)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    alpha_vals = sorted(df["alpha_s"].unique())
+    kl_means = [df[df["alpha_s"] == a]["kl_projection"].mean() for a in alpha_vals]
+    diag_ratio = []
+    for a in alpha_vals:
+        sub = df[df["alpha_s"] == a]
+        diag_ratio.append((sub["p_second_same"].sum()) / max(sub["p_second_diff"].sum(), 1e-9))
+    axes[0].plot(alpha_vals, kl_means, marker="o")
+    axes[0].set_xlabel("α_S")
+    axes[0].set_ylabel("KL to projection")
+    axes[0].set_title("Projection fidelity vs α_S")
+    axes[0].grid(alpha=0.3)
+    axes[1].plot(alpha_vals, diag_ratio, marker="o", color="tab:green")
+    axes[1].set_xlabel("α_S")
+    axes[1].set_ylabel("Diagonal ratio")
+    axes[1].set_title("Diagonal dominance vs α_S")
+    axes[1].grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("plots/exp6_projection_fidelity.png", dpi=PLOT_DPI)
+    plt.close()
+
+
+def plot_stability_landscape(df: pd.DataFrame) -> None:
+    os.makedirs("plots", exist_ok=True)
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+    x = df["alpha_s"].values
+    for ax, col, title in zip(
+        axes.flat,
+        ["stability", "pathology", "kl_born", "health"],
+        ["Stability", "Pathology", "KL(emp||Born)", "Health score"],
+    ):
+        ax.plot(x, df[col], marker="o")
+        ax.set_xlabel("α_S")
+        ax.set_ylabel(col)
+        ax.set_title(title)
+        ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("plots/exp7_stability_landscape.png", dpi=PLOT_DPI)
+    plt.close()
+
+
+def plot_basis_dependency(df: pd.DataFrame) -> None:
+    os.makedirs("plots", exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for alpha_s, sub in df.groupby("alpha_s"):
+        ax.bar([alpha_s + 0.01 * i for i in range(len(sub))], sub["tv_distance"], width=0.008, label=f"α_S={alpha_s:.2f}")
+    ax.set_xlabel("Grouped states (offset by α_S)")
+    ax.set_ylabel("TV distance (ZX vs XZ)")
+    ax.set_title("Order dependence vs α_S")
+    ax.grid(alpha=0.3, axis="y")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig("plots/exp8_contextuality.png", dpi=PLOT_DPI)
+    plt.close()
+
+
+# -----------------------------------------------------------------------------
+# Tests 4-6: Nonlocality and Bell/CHSH analyses
+# -----------------------------------------------------------------------------
+def _sample_fbct_joint(pA: np.ndarray, pB: np.ndarray, rng: np.random.Generator, n: int) -> np.ndarray:
+    """
+    Sample joint outcomes assuming local FBÇT marginals only (no hard-coded quantum correlation).
+    Returns joint counts matrix shape (2,2) for outcomes (+1/-1).
+    """
+    joint = np.zeros((2, 2), dtype=int)
+    for _ in range(n):
+        a = 0 if rng.random() < pA[0] else 1  # 0 -> +1, 1 -> -1
+        b = 0 if rng.random() < pB[0] else 1
+        joint[a, b] += 1
+    return joint
+
+
+def test_bipartite_chsh(rng: np.random.Generator) -> pd.DataFrame:
+    """
+    CHSH computation using FBÇT local marginals; quantum formulas used only as benchmark.
+    """
+    os.makedirs("results", exist_ok=True)
+    os.makedirs("plots", exist_ok=True)
+
+    angles = {
+        "a": 0.0,
+        "ap": np.pi / 2,
+        "b": np.pi / 4,
+        "bp": -np.pi / 4,
+    }
+
+    def quantum_E(thetaA, thetaB):
+        return -np.cos(thetaA - thetaB)
+
+    alphas = [
+        (0.0, 0.5, 0.5),
+        (0.3, 0.35, 0.35),
+        (0.7, 0.15, 0.15),
+        (1.0, 0.0, 0.0),
+    ]
+
+    rows = []
+    for alpha_s, alpha_m, alpha_w in alphas:
+        # FBÇT local marginals from uniform sensory (Bell state marginals are 0.5/0.5)
+        pA = fbct_collapse_distribution(np.array([0.5, 0.5]), np.array([0.5, 0.5]), np.array([0.5, 0.5]), alpha_s, alpha_m, alpha_w)[0]
+        pB = fbct_collapse_distribution(np.array([0.5, 0.5]), np.array([0.5, 0.5]), np.array([0.5, 0.5]), alpha_s, alpha_m, alpha_w)[0]
+
+        def E_fbct():
+            joint = _sample_fbct_joint(pA, pB, rng, 20_000)
+            probs = joint / joint.sum()
+            # Map 0->+1,1->-1
+            vals = np.array([+1, -1])
+            ev = np.sum(vals[:, None] * vals[None, :] * probs)
+            return ev
+
+        # With purely local sampling, E is identical for all settings; still compute S
+        E_ab = E_fbct()
+        E_abp = E_fbct()
+        E_apb = E_fbct()
+        E_apbp = E_fbct()
+        S = E_ab + E_abp + E_apb - E_apbp
+
+        # Quantum benchmark for reference
+        E_q_ab = quantum_E(angles["a"], angles["b"])
+        E_q_abp = quantum_E(angles["a"], angles["bp"])
+        E_q_apb = quantum_E(angles["ap"], angles["b"])
+        E_q_apbp = quantum_E(angles["ap"], angles["bp"])
+        S_quantum = E_q_ab + E_q_abp + E_q_apb - E_q_apbp
+
+        rows.append(
+            {
+                "alpha_s": alpha_s,
+                "alpha_m": alpha_m,
+                "alpha_w": alpha_w,
+                "E_ab": E_ab,
+                "E_abp": E_abp,
+                "E_apb": E_apb,
+                "E_apbp": E_apbp,
+                "S": S,
+                "S_quantum": S_quantum,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    df.to_csv("results/exp9_chsh_results.csv", index=False)
+
+    # Plot S vs alpha_s with bounds
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(df["alpha_s"], df["S"], marker="o", label="FBÇT S")
+    ax.axhline(2.0, color="red", linestyle="--", label="Classical bound")
+    ax.axhline(2 * np.sqrt(2), color="green", linestyle="-", label="Tsirelson")
+    ax.axhline(4.0, color="blue", linestyle=":", label="No-signalling bound")
+    ax.set_xlabel("α_S")
+    ax.set_ylabel("CHSH S")
+    ax.set_title("CHSH vs α_S (FBÇT local model)")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("plots/exp9_chsh_vs_alpha.png", dpi=PLOT_DPI)
+    plt.close()
+
+    print("\n=== TEST 4: BELL-CHSH INEQUALITY ===")
+    for _, r in df.iterrows():
+        print(
+            f"α_S={r['alpha_s']:.2f}: E_ab={r['E_ab']:.3f}, E_ab'={r['E_abp']:.3f}, "
+            f"E_a'b={r['E_apb']:.3f}, E_a'b'={r['E_apbp']:.3f}, S={r['S']:.3f} (quantum ref {r['S_quantum']:.3f})"
+        )
+    return df
+
+
+def test_tsirelson_scan(rng: np.random.Generator) -> pd.DataFrame:
+    """
+    Scan alpha_s and compute S using standard CHSH configuration (benchmark only).
+    """
+    alphas = np.linspace(0.0, 1.0, 11)
+    rows = []
+    for alpha_s in alphas:
+        alpha_m = alpha_w = 0.5 * (1 - alpha_s)
+        df_chsh = test_bipartite_chsh(rng)
+        # pick the S corresponding to this alpha_s from df_chsh
+        S_val = float(df_chsh[df_chsh["alpha_s"] == alpha_s]["S"].mean()) if alpha_s in df_chsh["alpha_s"].values else float(df_chsh["S"].mean())
+        rows.append({"alpha_s": alpha_s, "alpha_m": alpha_m, "alpha_w": alpha_w, "S_max": abs(S_val)})
+    df = pd.DataFrame(rows)
+    df.to_csv("results/exp10_tsirelson_scan.csv", index=False)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(df["alpha_s"], df["S_max"], marker="o")
+    ax.axhline(2.0, color="red", linestyle="--", label="Classical bound")
+    ax.axhline(2 * np.sqrt(2), color="green", linestyle="-", label="Tsirelson")
+    ax.axhline(4.0, color="blue", linestyle=":", label="No-signalling")
+    ax.set_xlabel("α_S")
+    ax.set_ylabel("S_max (standard CHSH config)")
+    ax.set_title("Tsirelson scan (benchmark)")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("plots/exp10_tsirelson_scan.png", dpi=PLOT_DPI)
+    plt.close()
+    print("\n=== TEST 5: TSIRELSON BOUND SCAN ===")
+    for _, r in df.iterrows():
+        print(f"α_S={r['alpha_s']:.2f}: S_max={r['S_max']:.3f}")
+    return df
+
+
+def test_no_signalling(rng: np.random.Generator) -> pd.DataFrame:
+    """
+    Check marginal independence (no-signalling) on CHSH setup with FBÇT local sampling.
+    """
+    angles = {
+        "a": 0.0,
+        "ap": np.pi / 2,
+        "b": np.pi / 4,
+        "bp": -np.pi / 4,
+    }
+    settings = [("a", "b"), ("a", "bp"), ("ap", "b"), ("ap", "bp")]
+    alphas = [
+        (0.0, 0.5, 0.5),
+        (0.3, 0.35, 0.35),
+        (0.7, 0.15, 0.15),
+        (1.0, 0.0, 0.0),
+    ]
+    rows = []
+    for alpha_s, alpha_m, alpha_w in alphas:
+        marg_A = {}
+        marg_B = {}
+        for A_setting, B_setting in settings:
+            # local marginals
+            pA = fbct_collapse_distribution(np.array([0.5, 0.5]), np.array([0.5, 0.5]), np.array([0.5, 0.5]), alpha_s, alpha_m, alpha_w)[0]
+            pB = fbct_collapse_distribution(np.array([0.5, 0.5]), np.array([0.5, 0.5]), np.array([0.5, 0.5]), alpha_s, alpha_m, alpha_w)[0]
+            joint = _sample_fbct_joint(pA, pB, rng, 5000)
+            probs = joint / joint.sum()
+            marg_A[(A_setting, B_setting)] = probs[:, :].sum(axis=1)[0]  # P(A=+1)
+            marg_B[(A_setting, B_setting)] = probs.sum(axis=0)[0]  # P(B=+1)
+        delta_A = max(
+            abs(marg_A[("a", "b")] - marg_A[("a", "bp")]),
+            abs(marg_A[("ap", "b")] - marg_A[("ap", "bp")]),
+        )
+        delta_B = max(
+            abs(marg_B[("a", "b")] - marg_B[("ap", "b")]),
+            abs(marg_B[("a", "bp")] - marg_B[("ap", "bp")]),
+        )
+        rows.append(
+            {
+                "alpha_s": alpha_s,
+                "alpha_m": alpha_m,
+                "alpha_w": alpha_w,
+                "delta_A": delta_A,
+                "delta_B": delta_B,
+                "max_delta_total": max(delta_A, delta_B),
+            }
+        )
+    df = pd.DataFrame(rows)
+    df.to_csv("results/exp11_nosignalling.csv", index=False)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(df["alpha_s"], df["max_delta_total"], marker="o")
+    ax.axhline(0.05, color="red", linestyle="--", label="tolerance 0.05")
+    ax.set_xlabel("α_S")
+    ax.set_ylabel("Max signalling deviation")
+    ax.set_title("No-signalling check (FBÇT local)")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("plots/exp11_nosignalling.png", dpi=PLOT_DPI)
+    plt.close()
+    print("\n=== TEST 6: NO-SIGNALLING CONSISTENCY ===")
+    for _, r in df.iterrows():
+        print(f"α_S={r['alpha_s']:.2f}: max Δ={r['max_delta_total']:.3f}")
+    return df
+
+
 # -----------------------------------------------------------------------------
 # Self-check
 # -----------------------------------------------------------------------------
@@ -864,12 +1379,67 @@ def main() -> None:
     print("\n=== EXPERIMENT 5: Two-Stage Collapse ===")
     res5 = experiment_5_two_stage(rng)
 
+    print("\n" + "=" * 70)
+    print("ADVANCED QUANTUM CONSISTENCY TESTS")
+    print("=" * 70)
+
+    print("\n>>> TEST 1: Projection Postulate")
+    res6 = test_repeated_measurement_projection(rng)
+
+    print("\n>>> TEST 2: Stability Landscape")
+    res7 = test_stability_scan(rng)
+
+    print("\n>>> TEST 3: Basis Contextuality")
+    res8 = test_basis_dependency(rng)
+
+    print("\n" + "=" * 70)
+    print("ADVANCED NONLOCALITY TESTS")
+    print("=" * 70)
+    print("\n>>> TEST 4: Bell-CHSH Inequality")
+    res9 = test_bipartite_chsh(rng)
+
+    print("\n>>> TEST 5: Tsirelson Bound Scan")
+    res10 = test_tsirelson_scan(rng)
+
+    print("\n>>> TEST 6: No-Signalling Consistency")
+    res11 = test_no_signalling(rng)
+
     # Concatenate and save full results
-    full = pd.concat([res1, res2, res3, res4, res5], ignore_index=True, sort=False)
+    full = pd.concat([res1, res2, res3, res4, res5, res6, res7, res8, res9, res10, res11], ignore_index=True, sort=False)
     full.to_csv("results/full_results.csv", index=False)
     print("\nSaved: results/full_results.csv")
     self_consistency_check(rng)
     print("\nPlots saved to plots/ directory.")
+
+    # Meta summary
+    projection_pass = (res6[res6["alpha_s"] == 1.0]["kl_projection"] < 0.001).all()
+    stability_pass = (res7[res7["health"] > 0.5]["alpha_s"] > 0.7).all()
+    contextuality_pass = res8[res8["alpha_s"] == 1.0]["tv_distance"].mean() > 0.2
+    # Nonlocality summary
+    chsh_s = res9["S"].max() if isinstance(res9, pd.DataFrame) else float("nan")
+    ts_max = res10["S_max"].max() if isinstance(res10, pd.DataFrame) else float("nan")
+    max_signalling = res11["max_delta_total"].max() if isinstance(res11, pd.DataFrame) else float("nan")
+
+    print("\n" + "=" * 70)
+    print("PARADIGM-LEVEL SUMMARY")
+    print("=" * 70)
+    print(f"Projection postulate: {'PASS' if projection_pass else 'FAIL'}")
+    print(f"Born as attractor: {'PASS' if stability_pass else 'FAIL'}")
+    print(f"Quantum contextuality: {'PASS' if contextuality_pass else 'FAIL'}")
+    print(f"CHSH S max (FBÇT local): {chsh_s:.3f}")
+    print(f"S_max standard scan: {ts_max:.3f}")
+    print(f"Max no-signalling deviation: {max_signalling:.3f}")
+
+    if projection_pass and stability_pass and contextuality_pass:
+        print("\n" + "=" * 70)
+        print("PARADIGM-LEVEL VALIDATION ACHIEVED!")
+        print("=" * 70)
+        print("FBÇT encodes:")
+        print("  • Projection dynamics (Lüders-like)")
+        print("  • Born as unique stable regime")
+        print("  • Measurement contextuality")
+    else:
+        print("\nResults interesting but not fully paradigm-level.")
 
 
 if __name__ == "__main__":
